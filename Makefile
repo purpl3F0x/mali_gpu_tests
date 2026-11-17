@@ -42,6 +42,11 @@ $(FRONT_OBJS): lviv_rename.h
 front.o gl_api.o: CFLAGS += -include lviv_rename.h
 gltf_scene.o: CXXFLAGS += -include lviv_rename.h
 
+main.o: main.c $(HDRS)
+	@printf '#include <EGL/egl.h>\n#include <GLES2/gl2.h>\n' | $(CC) -E -x c - >/dev/null 2>&1 || \
+		{ echo "no EGL or GLES2 headers: sudo apt install libegl-dev libgles-dev"; exit 1; }
+	$(CC) $(CFLAGS) -c $< -o $@
+
 %.o: %.c $(HDRS)
 	$(CHECK_SUBMODULES)
 	$(CC) $(CFLAGS) -c $< -o $@
