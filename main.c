@@ -21,7 +21,6 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
-#include <dlfcn.h>
 #include <fcntl.h>
 #include <glob.h>
 #include <math.h>
@@ -110,63 +109,19 @@ static int has_extension(const char *name)
 // ---------------------------------------------------------------------------------------------
 // EGL and GL
 
-// The display, initialized; else EGL_NO_DISPLAY, why told
-static EGLDisplay try_display(const char *what, EGLDisplay display)
-{
-    EGLint major, minor;
-    if (display == EGL_NO_DISPLAY)
-        fprintf(stderr, "  %s: no display (0x%x)\n", what, eglGetError());
-    else if (!eglInitialize(display, &major, &minor))
-        fprintf(stderr, "  %s: eglInitialize failed (0x%x)\n", what, eglGetError());
-    else
-        return display;
-    return EGL_NO_DISPLAY;
-}
-
-// A display without a window system, none opened: Mesa's surfaceless one or an EGL device (Lima),
-// else the default one with DISPLAY and WAYLAND_DISPLAY unset (libmali's headless or fbdev backend)
-static EGLDisplay open_display(void)
-{
-    EGLDisplay display = EGL_NO_DISPLAY;
-    const char *client = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
-    PFNEGLGETPLATFORMDISPLAYEXTPROC get =
-        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
-    if (get && client && strstr(client, "EGL_MESA_platform_surfaceless"))
-        display = try_display("surfaceless", get(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL));
-#ifdef EGL_EXT_device_enumeration
-    PFNEGLQUERYDEVICESEXTPROC query = (PFNEGLQUERYDEVICESEXTPROC)eglGetProcAddress("eglQueryDevicesEXT");
-    EGLDeviceEXT devices[8];
-    EGLint count = 0;
-    if (display == EGL_NO_DISPLAY && get && query && client && strstr(client, "EGL_EXT_platform_device") &&
-        query(8, devices, &count))
-        for (EGLint i = 0; i < count && display == EGL_NO_DISPLAY; i++)
-        {
-            char what[32];
-            snprintf(what, sizeof what, "EGL device %d", (int)i);
-            display = try_display(what, get(EGL_PLATFORM_DEVICE_EXT, devices[i], NULL));
-        }
-#endif
-    if (display == EGL_NO_DISPLAY)
-    {
-        unsetenv("DISPLAY");
-        unsetenv("WAYLAND_DISPLAY");
-        display = try_display("default display, no window system", eglGetDisplay(EGL_DEFAULT_DISPLAY));
-    }
-    if (display == EGL_NO_DISPLAY)
-    {
-        Dl_info library;
-        fprintf(stderr, "  EGL library: %s\n",
-                dladdr((void *)eglGetDisplay, &library) && library.dli_fname ? library.dli_fname : "unknown");
-        fprintf(stderr, "  EGL client extensions: %s\n", client ? client : "(none)");
-        die("no EGL display without a window system (libmali's X11 build has none: its headless or fbdev "
-            "build, or Lima, does)");
-    }
-    return display;
-}
-
 static void egl_init(void)
 {
-    EGLDisplay display = open_display();
+    EGLint major, minor;
+    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor))
+    {
+        // Mesa without a window system
+        PFNEGLGETPLATFORMDISPLAYEXTPROC get =
+            (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+        display = get ? get(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL) : EGL_NO_DISPLAY;
+        if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor))
+            die("no EGL display (libmali's X11 backend needs DISPLAY set)");
+    }
     eglBindAPI(EGL_OPENGL_ES_API);
     EGLint attributes[] = {EGL_SURFACE_TYPE,
                            EGL_PBUFFER_BIT,
