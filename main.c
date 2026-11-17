@@ -1,9 +1,8 @@
 // mali_bench: the ZCU104's Mali-400 MP2 (Ubuntu, OpenGL ES 2.0 on EGL: libmali or Lima) drawing a
-// glTF frame as gl_test's GPU draws it, timed. The front end (front.c, lviv_gl) runs once on the CPU;
-// its triangle records, already transformed, lit and clipped, become clip-space vertices (x, y, z
-// and 1/w, so color and uv stay perspective-correct), drawn through a pass-through vertex shader
-// into a width x height FBO: the record's texture function, blend and depth test, nearest texels,
-// depth discarded rather than written back.
+// glTF scene, its raster and write-back timed. The vertices are transformed and lit once on the CPU
+// (gltf.c); the Mali's vertex shader only passes them on. Into a width x height FBO: the base color
+// times its texture (nearest texels), the depth test, back faces culled but where double sided,
+// BLEND materials blended after the rest; depth discarded rather than written back.
 //
 // Frames timed (glFinish), each kind its own run:
 //   full        the frame
@@ -14,7 +13,7 @@
 // (tracefs) time the GP (vertices, binning) and PP (raster, write-back) jobs themselves: the Mali
 // driver's mali_timeline_event (built with CONFIG_MALI400_PROFILING), or Lima's drm scheduler events.
 //
-// Usage: mali_bench [-n FRAMES] [-a ANGLE] [-s WxH] [-m MIB] [-o PNG] [-t TXT] [-T] MODEL
+// Usage: mali_bench [-n FRAMES] [-a ANGLE] [-s WxH] [-o PNG] [-t TXT] [-T] MODEL
 // Writes MODEL_mali_times.txt (every frame's times) and MODEL_mali.png (the frame) by default.
 
 #define _GNU_SOURCE
@@ -33,9 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "front.h"
-
-#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "gltf.h"
 #include "stb_image_write.h"
 
 #ifndef EGL_PLATFORM_SURFACELESS_MESA
@@ -44,45 +41,6 @@
 
 #define WARMUP 10
 #define TINY 16 // a Mali-400 tile
-
-// gpu_types_pkg.sv's texture functions; COLOR untextured
-enum
-{
-    REPLACE,
-    MODULATE,
-    DECAL,
-    BLEND,
-    ADD,
-    COLOR,
-    FUNCTIONS
-};
-
-static const GLenum blend_factors[] = {GL_ZERO,      GL_ONE,           GL_SRC_COLOR,          GL_ONE_MINUS_SRC_COLOR,
-                                       GL_DST_COLOR, GL_ONE_MINUS_DST_COLOR, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-                                       GL_DST_ALPHA, GL_ONE_MINUS_DST_ALPHA};
-#define BLEND_FACTORS (int)(sizeof blend_factors / sizeof blend_factors[0])
-
-// depth_func, a mask of {greater, equal, less}
-static const GLenum depth_funcs[8] = {GL_NEVER,   GL_LESS,     GL_EQUAL,  GL_LEQUAL,
-                                      GL_GREATER, GL_NOTEQUAL, GL_GEQUAL, GL_ALWAYS};
-
-// Clip space; RGBA
-typedef struct
-{
-    float position[4];
-    uint8_t color[4];
-    float uv[2];
-} vertex_t;
-
-// A run of triangles with one state
-typedef struct
-{
-    int function;
-    GLuint texture;
-    uint8_t blend, depth_func;
-    GLint first;
-    GLsizei count;
-} draw_t;
 
 enum
 {
@@ -96,11 +54,12 @@ static const char *mode_names[MODES] = {"full frame", "draws scissored to 1x1", 
                                         "clear only, 16x16"};
 
 static int width = 1280, height = 720;
-static GLuint programs[FUNCTIONS];
+static scene_t scene;
+static GLuint programs[2]; // untextured, textured
 static GLuint fbo, tiny_fbo;
-static GLuint textures[FRONT_TEXTURES][4]; // by tex_id and texture_mode
-static draw_t *draws;
-static size_t draw_count;
+static GLuint *textures;
+static GLenum index_type; // 0: drawn unindexed
+static size_t index_bytes;
 static PFNGLDISCARDFRAMEBUFFEREXTPROC discard;
 
 static double now(void)
@@ -193,20 +152,11 @@ static GLuint compile(GLenum type, const char *source)
     return shader;
 }
 
-// The texture functions as sw_raster.c has them; GL_BLEND's env color 0, as the core's
+// Pass-through vertex shaders: the positions are clip space already
 static void make_programs(void)
 {
-    static const char *bodies[FUNCTIONS] = {
-        "gl_FragColor = texture2D(tex, v_uv);",
-        "gl_FragColor = v_color * texture2D(tex, v_uv);",
-        "vec4 t = texture2D(tex, v_uv); gl_FragColor = vec4(mix(v_color.rgb, t.rgb, t.a), v_color.a);",
-        "vec4 t = texture2D(tex, v_uv); gl_FragColor = vec4(v_color.rgb * (1.0 - t.rgb), v_color.a * t.a);",
-        "vec4 t = texture2D(tex, v_uv); gl_FragColor = vec4(min(v_color.rgb + t.rgb, 1.0), v_color.a * t.a);",
-        "gl_FragColor = v_color;",
-    };
-    for (int f = 0; f < FUNCTIONS; f++)
+    for (int textured = 0; textured < 2; textured++)
     {
-        const int textured = f != COLOR;
         char vs[512], fs[512];
         snprintf(vs, sizeof vs,
                  "attribute vec4 position;\n"
@@ -220,8 +170,9 @@ static void make_programs(void)
                  "precision mediump float;\n"
                  "varying lowp vec4 v_color;\n"
                  "%s"
-                 "void main() { %s }\n",
-                 textured ? "varying mediump vec2 v_uv;\nuniform sampler2D tex;\n" : "", bodies[f]);
+                 "void main() { gl_FragColor = v_color%s; }\n",
+                 textured ? "varying mediump vec2 v_uv;\nuniform sampler2D tex;\n" : "",
+                 textured ? " * texture2D(tex, v_uv)" : "");
         GLuint p = glCreateProgram();
         glAttachShader(p, compile(GL_VERTEX_SHADER, vs));
         glAttachShader(p, compile(GL_FRAGMENT_SHADER, fs));
@@ -232,8 +183,8 @@ static void make_programs(void)
         GLint ok;
         glGetProgramiv(p, GL_LINK_STATUS, &ok);
         if (!ok)
-            die("program %d did not link", f);
-        programs[f] = p;
+            die("program %d did not link", textured);
+        programs[textured] = p;
     }
 }
 
@@ -258,100 +209,66 @@ static GLuint make_fbo(int w, int h, GLenum depth_format)
     return f;
 }
 
-static uint32_t spread(uint32_t v)
+static void upload_textures(void)
 {
-    v &= 0x7ffu;
-    v = (v | v << 8) & 0x00ff00ffu;
-    v = (v | v << 4) & 0x0f0f0f0fu;
-    v = (v | v << 2) & 0x33333333u;
-    return (v | v << 1) & 0x55555555u;
-}
-
-// The GL texture for a record's tex_id and texture_mode (its wrap modes): its Morton-order ARGB
-// texels in rows, RGBA, row 0 at t = 0; 0 if none
-static GLuint texture_of(const front_frame_t *f, unsigned id, unsigned mode)
-{
-    if (id >= FRONT_TEXTURES || !f->texels[id])
-        return 0;
-    GLuint *t = &textures[id][mode & 3];
-    if (*t)
-        return *t;
-    const uint32_t size = 1u << f->log2_size[id];
-    uint8_t *rgba = malloc((size_t)size * size * 4);
-    if (!rgba)
-        die("out of memory");
-    for (uint32_t y = 0; y < size; y++)
-        for (uint32_t x = 0; x < size; x++)
-        {
-            const uint32_t w = f->texels[id][spread(x) | spread(y) << 1];
-            uint8_t *p = &rgba[4 * ((size_t)size * y + x)];
-            p[0] = (uint8_t)(w >> 16);
-            p[1] = (uint8_t)(w >> 8);
-            p[2] = (uint8_t)w;
-            p[3] = (uint8_t)(w >> 24);
-        }
-    glGenTextures(1, t);
-    glBindTexture(GL_TEXTURE_2D, *t);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                    mode >> GPU_TEXTURE_MODE_U_SHIFT & GPU_TEXTURE_MODE_U_MASK ? GL_REPEAT : GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                    mode >> GPU_TEXTURE_MODE_V_SHIFT & GPU_TEXTURE_MODE_V_MASK ? GL_REPEAT : GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)size, (GLsizei)size, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-    free(rgba);
-    return *t;
-}
-
-// The records as vertices, in one buffer, and their runs of one state; the buffer's bytes
-static size_t build(const front_frame_t *f)
-{
-    vertex_t *vertices = malloc((size_t)f->count * 3 * sizeof *vertices);
-    draws = malloc((size_t)f->count * sizeof *draws);
-    if (!vertices || !draws)
-        die("out of memory");
-    for (uint32_t i = 0; i < f->count; i++)
+    textures = calloc((size_t)scene.texture_count + 1, sizeof *textures);
+    for (int i = 0; i < scene.texture_count; i++)
     {
-        const gpu_triangle_t *r = &f->triangles[i];
-        int function = r->texture_function < COLOR ? r->texture_function : COLOR;
-        const GLuint texture = function == COLOR ? 0 : texture_of(f, r->tex_id, r->texture_mode);
-        if (!texture)
-            function = COLOR;
-        draw_t *d = draw_count ? &draws[draw_count - 1] : NULL;
-        if (!d || d->function != function || d->texture != texture || d->blend != r->blend ||
-            d->depth_func != r->depth_func)
-        {
-            d = &draws[draw_count++];
-            *d = (draw_t){function, texture, r->blend, r->depth_func, (GLint)(3 * i), 0};
-        }
-        d->count += 3;
-        for (int k = 0; k < 3; k++)
-        {
-            const gpu_vertex_t *v = &r->v[k];
-            const float w = v->w > 0.0f && isfinite(1.0f / v->w) ? 1.0f / v->w : 1.0f; // v->w is 1/w
-            vertex_t *out = &vertices[3 * i + k];
-            // Pixels from the top left, centers at .5; z 0 to 1
-            out->position[0] = (2.0f * v->x / (float)width - 1.0f) * w;
-            out->position[1] = (1.0f - 2.0f * v->y / (float)height) * w;
-            out->position[2] = (2.0f * v->z - 1.0f) * w;
-            out->position[3] = w;
-            out->color[0] = (uint8_t)(v->color >> 16);
-            out->color[1] = (uint8_t)(v->color >> 8);
-            out->color[2] = (uint8_t)v->color;
-            out->color[3] = (uint8_t)(v->color >> 24);
-            out->uv[0] = v->u;
-            out->uv[1] = v->v;
-        }
+        const scene_texture_t *t = &scene.textures[i];
+        glGenTextures(1, &textures[i]);
+        glBindTexture(GL_TEXTURE_2D, textures[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, t->repeat_s ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, t->repeat_t ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, t->width, t->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, t->rgba);
     }
-    const size_t bytes = (size_t)f->count * 3 * sizeof *vertices;
-    GLuint buffer;
-    glGenBuffers(1, &buffer);
-    glBindBuffer(GL_ARRAY_BUFFER, buffer);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)bytes, vertices, GL_STATIC_DRAW);
-    free(vertices);
-    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(vertex_t), (const void *)offsetof(vertex_t, position));
-    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(vertex_t), (const void *)offsetof(vertex_t, color));
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(vertex_t), (const void *)offsetof(vertex_t, uv));
+}
+
+// The vertices and indices into buffers: 16-bit indices where they do, else 32-bit with
+// OES_element_index_uint, else every triangle's vertices in turn, unindexed. Their bytes.
+static size_t upload_geometry(void)
+{
+    const scene_vertex_t *vertices = scene.vertices;
+    size_t vertex_count = scene.vertex_count, bytes = 0;
+    scene_vertex_t *expanded = NULL;
+    GLuint buffers[2];
+    glGenBuffers(2, buffers);
+    if (scene.vertex_count <= 65536 || has_extension("GL_OES_element_index_uint"))
+    {
+        index_type = scene.vertex_count <= 65536 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
+        index_bytes = index_type == GL_UNSIGNED_SHORT ? 2 : 4;
+        void *indices = scene.indices;
+        if (index_bytes == 2)
+        {
+            uint16_t *small = malloc((size_t)scene.index_count * 2 + 2);
+            for (uint32_t i = 0; i < scene.index_count; i++)
+                small[i] = (uint16_t)scene.indices[i];
+            indices = small;
+        }
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buffers[1]);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(scene.index_count * index_bytes), indices, GL_STATIC_DRAW);
+        bytes += scene.index_count * index_bytes;
+        if (indices != scene.indices)
+            free(indices);
+    }
+    else
+    {
+        expanded = malloc((size_t)scene.index_count * sizeof *expanded + 1);
+        for (uint32_t i = 0; i < scene.index_count; i++)
+            expanded[i] = scene.vertices[scene.indices[i]];
+        vertices = expanded;
+        vertex_count = scene.index_count;
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, buffers[0]);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vertex_count * sizeof *vertices), vertices, GL_STATIC_DRAW);
+    bytes += vertex_count * sizeof *vertices;
+    free(expanded);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(scene_vertex_t),
+                          (const void *)offsetof(scene_vertex_t, position));
+    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(scene_vertex_t),
+                          (const void *)offsetof(scene_vertex_t, color));
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(scene_vertex_t), (const void *)offsetof(scene_vertex_t, uv));
     for (GLuint a = 0; a < 3; a++)
         glEnableVertexAttribArray(a);
     return bytes;
@@ -372,33 +289,43 @@ static void render(int mode)
             glEnable(GL_SCISSOR_TEST);
             glScissor(0, 0, 1, 1);
         }
-        int function = -1, blend = -1, depth_func = -1;
+        int program = -1, blended = -1, culled = -1, clockwise = -1;
         GLuint texture = 0;
-        for (size_t i = 0; i < draw_count; i++)
+        for (int i = 0; i < scene.draw_count; i++)
         {
-            const draw_t *d = &draws[i];
-            if (d->function != function)
-                glUseProgram(programs[function = d->function]);
-            if (d->texture && d->texture != texture)
-                glBindTexture(GL_TEXTURE_2D, texture = d->texture);
-            if (d->blend != blend)
+            const scene_draw_t *d = &scene.draws[i];
+            const int textured = d->texture >= 0;
+            if (textured != program)
+                glUseProgram(programs[program = textured]);
+            if (textured && textures[d->texture] != texture)
+                glBindTexture(GL_TEXTURE_2D, texture = textures[d->texture]);
+            if (d->blended != blended)
             {
-                blend = d->blend;
-                const int s = blend >> GPU_SFACTOR_OP_SHIFT & GPU_SFACTOR_OP_MASK;
-                const int t = blend >> GPU_DFACTOR_OP_SHIFT & GPU_DFACTOR_OP_MASK;
-                const GLenum sf = s < BLEND_FACTORS ? blend_factors[s] : GL_ONE;
-                const GLenum df = t < BLEND_FACTORS ? blend_factors[t] : GL_ZERO;
-                if (sf == GL_ONE && df == GL_ZERO)
-                    glDisable(GL_BLEND);
-                else
+                if ((blended = d->blended))
                 {
                     glEnable(GL_BLEND);
-                    glBlendFunc(sf, df);
+                    glDepthMask(GL_FALSE);
+                }
+                else
+                {
+                    glDisable(GL_BLEND);
+                    glDepthMask(GL_TRUE);
                 }
             }
-            if (d->depth_func != depth_func)
-                glDepthFunc(depth_funcs[(depth_func = d->depth_func) & 7]);
-            glDrawArrays(GL_TRIANGLES, d->first, d->count);
+            if (!d->double_sided != culled)
+            {
+                if ((culled = !d->double_sided))
+                    glEnable(GL_CULL_FACE);
+                else
+                    glDisable(GL_CULL_FACE);
+            }
+            if (d->clockwise != clockwise)
+                glFrontFace((clockwise = d->clockwise) ? GL_CW : GL_CCW);
+            if (index_type)
+                glDrawElements(GL_TRIANGLES, (GLsizei)d->index_count, index_type,
+                               (const void *)(d->first_index * index_bytes));
+            else
+                glDrawArrays(GL_TRIANGLES, (GLint)d->first_index, (GLsizei)d->index_count);
         }
     }
     if (discard)
@@ -802,13 +729,12 @@ static void report(FILE *out, const char *prefix, const result_t *results, int f
 }
 
 // Every frame's times, one line each, the report after them as comments
-static void write_times(const char *path, const char *model, float angle, const front_frame_t *f,
-                        const result_t *results, int frames)
+static void write_times(const char *path, const char *model, float angle, const result_t *results, int frames)
 {
     FILE *out = fopen(path, "w");
     if (!out)
         die("%s: cannot write it", path);
-    fprintf(out, "# mali_bench %s, angle %g: %u triangles to the raster, %d x %d\n", model, angle, f->count, width,
+    fprintf(out, "# mali_bench %s, angle %g: %u triangles, %d x %d\n", model, angle, scene.index_count / 3, width,
             height);
     fprintf(out, "# GL: %s, %s, %s\n", (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER),
             (const char *)glGetString(GL_VERSION));
@@ -829,10 +755,9 @@ int main(int argc, char **argv)
 {
     int frames = 100, use_trace = 1;
     float angle = 0;
-    size_t frame_mib = 256;
     const char *png = NULL, *times = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "n:a:s:m:o:t:T")) != -1)
+    while ((opt = getopt(argc, argv, "n:a:s:o:t:T")) != -1)
         switch (opt)
         {
         case 'n':
@@ -844,9 +769,6 @@ int main(int argc, char **argv)
         case 's':
             if (sscanf(optarg, "%dx%d", &width, &height) != 2)
                 width = 0;
-            break;
-        case 'm':
-            frame_mib = (size_t)atol(optarg);
             break;
         case 'o':
             png = optarg;
@@ -860,16 +782,15 @@ int main(int argc, char **argv)
         default:
             frames = 0;
         }
-    if (optind != argc - 1 || frames < 1 || width < 1 || height < 1 || frame_mib < 1)
+    if (optind != argc - 1 || frames < 1 || width < 1 || height < 1)
     {
         fprintf(stderr,
-                "usage: %s [-n FRAMES] [-a ANGLE] [-s WxH] [-m MIB] [-o PNG] [-t TXT] [-T] MODEL\n"
-                "  MODEL  a .glb, or a .gltf with its buffers embedded\n"
+                "usage: %s [-n FRAMES] [-a ANGLE] [-s WxH] [-o PNG] [-t TXT] [-T] MODEL\n"
+                "  MODEL  a .glb, or a .gltf with its buffers and images embedded or beside it\n"
                 "  -n     frames timed of each kind (100), after %d unmeasured\n"
-                "  -a     the model turned by ANGLE degrees, as gl_test turns it (0)\n"
-                "  -s     frame size (1280x720, gl_test's; at most 64 tiles of 128)\n"
-                "  -m     lviv_gl's frame memory in MiB (256: about 2.6 million triangles)\n"
-                "  -o     the Mali's frame as a PNG (MODEL_mali.png here; - none)\n"
+                "  -a     the model turned by ANGLE degrees about its vertical axis (0)\n"
+                "  -s     frame size (1280x720)\n"
+                "  -o     the frame as a PNG (MODEL_mali.png here; - none)\n"
                 "  -t     every frame's times (MODEL_mali_times.txt here; - none)\n"
                 "  -T     no kernel GPU job events (else used when root)\n",
                 argv[0], WARMUP);
@@ -890,12 +811,9 @@ int main(int argc, char **argv)
     if (!times)
         times = default_times;
 
-    static front_frame_t f;
     char error[256];
-    if (front_build(model, width, height, angle, frame_mib << 20, &f, error, sizeof error) != 0)
+    if (scene_load(model, width, height, angle, &scene, error, sizeof error) != 0)
         die("%s", error);
-    if (f.count == 0)
-        die("%s: no triangles in the frame", model);
 
     egl_init();
     printf("GL: %s, %s, %s\n", (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER),
@@ -910,27 +828,27 @@ int main(int argc, char **argv)
     tiny_fbo = make_fbo(TINY, TINY, depth24 ? GL_DEPTH_COMPONENT24_OES : GL_DEPTH_COMPONENT16);
     if (has_extension("GL_EXT_discard_framebuffer"))
         discard = (PFNGLDISCARDFRAMEBUFFEREXTPROC)eglGetProcAddress("glDiscardFramebufferEXT");
-    glClearColor((f.clear_color >> 16 & 255) / 255.0f, (f.clear_color >> 8 & 255) / 255.0f,
-                 (f.clear_color & 255) / 255.0f, (f.clear_color >> 24) / 255.0f);
+    glClearColor(0x63 / 255.0f, 0x63 / 255.0f, 0x63 / 255.0f, 1.0f);
     glClearDepthf(1.0f);
     glEnable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
+    glDepthFunc(GL_LESS);
+    glCullFace(GL_BACK);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_DITHER);
-    const size_t bytes = build(&f);
+    upload_textures();
+    const size_t bytes = upload_geometry();
     const GLenum e = glGetError();
     if (e != GL_NO_ERROR)
         die("GL error 0x%04x setting up (0x0505: out of memory)", e);
 
-    int textured = 0;
-    for (int i = 0; i < FRONT_TEXTURES; i++)
-        for (int m = 0; m < 4; m++)
-            textured += textures[i][m] != 0;
-    printf("%s, angle %g: %u triangles to the raster (%d in the file), %d texture%s (%d GL), %d light%s, %s camera\n",
-           model, angle, f.count, f.file_triangles, f.textures, f.textures == 1 ? "" : "s", textured, f.lights,
-           f.lights == 1 ? "" : "s", f.own_camera ? "its" : "the default");
-    printf("%d x %d, depth %d-bit%s; %zu draw calls a frame, %.1f MiB of vertices\n", width, height,
-           depth24 ? 24 : 16, discard ? ", discarded" : ", written back (no EXT_discard_framebuffer)", draw_count,
-           bytes / 1048576.0);
+    printf("%s, angle %g: %u triangles, %u vertices, %d texture%s, %d draw calls, %s camera\n", model, angle,
+           scene.index_count / 3, scene.vertex_count, scene.texture_count, scene.texture_count == 1 ? "" : "s",
+           scene.draw_count, scene.own_camera ? "its" : "the default");
+    printf("%d x %d, depth %d-bit%s; %.1f MiB of geometry, %s\n", width, height, depth24 ? 24 : 16,
+           discard ? ", discarded" : ", written back (no EXT_discard_framebuffer)", bytes / 1048576.0,
+           index_type == GL_UNSIGNED_SHORT ? "16-bit indices"
+           : index_type                    ? "32-bit indices"
+                                           : "unindexed (no OES_element_index_uint)");
 
     if (use_trace)
         trace_open();
@@ -942,7 +860,7 @@ int main(int argc, char **argv)
     printf("\n");
     report(stdout, "", results, frames);
     if (strcmp(times, "-") != 0)
-        write_times(times, model, angle, &f, results, frames);
+        write_times(times, model, angle, results, frames);
     if (strcmp(png, "-") != 0)
         write_png(png);
     return 0;
