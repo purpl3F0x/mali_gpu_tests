@@ -21,6 +21,7 @@
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <glob.h>
 #include <math.h>
@@ -58,9 +59,25 @@ static scene_t scene;
 static GLuint programs[2]; // untextured, textured
 static GLuint fbo, tiny_fbo;
 static GLuint *textures;
-static GLenum index_type; // 0: drawn unindexed
-static size_t index_bytes;
+// A draw's triangles within one window of at most 65536 vertices, 16-bit indices into it
+typedef struct
+{
+    int draw;
+    uint32_t first_index, index_count;
+    size_t vertex_offset; // the window's first vertex, in bytes
+} batch_t;
+static batch_t *batches;
+static int batch_count;
 static PFNGLDISCARDFRAMEBUFFEREXTPROC discard;
+
+static void die(const char *format, ...);
+
+static void check_gl(const char *what)
+{
+    const GLenum e = glGetError();
+    if (e != GL_NO_ERROR)
+        die("GL error 0x%04x %s%s", e, what, e == GL_OUT_OF_MEMORY ? " (out of memory)" : "");
+}
 
 static double now(void)
 {
@@ -93,19 +110,63 @@ static int has_extension(const char *name)
 // ---------------------------------------------------------------------------------------------
 // EGL and GL
 
-static void egl_init(void)
+// The display, initialized; else EGL_NO_DISPLAY, why told
+static EGLDisplay try_display(const char *what, EGLDisplay display)
 {
     EGLint major, minor;
-    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor))
+    if (display == EGL_NO_DISPLAY)
+        fprintf(stderr, "  %s: no display (0x%x)\n", what, eglGetError());
+    else if (!eglInitialize(display, &major, &minor))
+        fprintf(stderr, "  %s: eglInitialize failed (0x%x)\n", what, eglGetError());
+    else
+        return display;
+    return EGL_NO_DISPLAY;
+}
+
+// A display without a window system, none opened: Mesa's surfaceless one or an EGL device (Lima),
+// else the default one with DISPLAY and WAYLAND_DISPLAY unset (libmali's headless or fbdev backend)
+static EGLDisplay open_display(void)
+{
+    EGLDisplay display = EGL_NO_DISPLAY;
+    const char *client = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+    PFNEGLGETPLATFORMDISPLAYEXTPROC get =
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    if (get && client && strstr(client, "EGL_MESA_platform_surfaceless"))
+        display = try_display("surfaceless", get(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL));
+#ifdef EGL_EXT_device_enumeration
+    PFNEGLQUERYDEVICESEXTPROC query = (PFNEGLQUERYDEVICESEXTPROC)eglGetProcAddress("eglQueryDevicesEXT");
+    EGLDeviceEXT devices[8];
+    EGLint count = 0;
+    if (display == EGL_NO_DISPLAY && get && query && client && strstr(client, "EGL_EXT_platform_device") &&
+        query(8, devices, &count))
+        for (EGLint i = 0; i < count && display == EGL_NO_DISPLAY; i++)
+        {
+            char what[32];
+            snprintf(what, sizeof what, "EGL device %d", (int)i);
+            display = try_display(what, get(EGL_PLATFORM_DEVICE_EXT, devices[i], NULL));
+        }
+#endif
+    if (display == EGL_NO_DISPLAY)
     {
-        // Mesa without a window system
-        PFNEGLGETPLATFORMDISPLAYEXTPROC get =
-            (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
-        display = get ? get(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL) : EGL_NO_DISPLAY;
-        if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor))
-            die("no EGL display (libmali's X11 backend needs DISPLAY set)");
+        unsetenv("DISPLAY");
+        unsetenv("WAYLAND_DISPLAY");
+        display = try_display("default display, no window system", eglGetDisplay(EGL_DEFAULT_DISPLAY));
     }
+    if (display == EGL_NO_DISPLAY)
+    {
+        Dl_info library;
+        fprintf(stderr, "  EGL library: %s\n",
+                dladdr((void *)eglGetDisplay, &library) && library.dli_fname ? library.dli_fname : "unknown");
+        fprintf(stderr, "  EGL client extensions: %s\n", client ? client : "(none)");
+        die("no EGL display without a window system (libmali's X11 build has none: its headless or fbdev "
+            "build, or Lima, does)");
+    }
+    return display;
+}
+
+static void egl_init(void)
+{
+    EGLDisplay display = open_display();
     eglBindAPI(EGL_OPENGL_ES_API);
     EGLint attributes[] = {EGL_SURFACE_TYPE,
                            EGL_PBUFFER_BIT,
@@ -222,56 +283,90 @@ static void upload_textures(void)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, t->repeat_s ? GL_REPEAT : GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, t->repeat_t ? GL_REPEAT : GL_CLAMP_TO_EDGE);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, t->width, t->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, t->rgba);
+        char what[64];
+        snprintf(what, sizeof what, "uploading texture %d (%d x %d)", i, t->width, t->height);
+        check_gl(what);
     }
 }
 
-// The vertices and indices into buffers: 16-bit indices where they do, else 32-bit with
-// OES_element_index_uint, else every triangle's vertices in turn, unindexed. Their bytes.
+static void point_attributes(size_t offset)
+{
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(scene_vertex_t),
+                          (const void *)(offset + offsetof(scene_vertex_t, position)));
+    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(scene_vertex_t),
+                          (const void *)(offset + offsetof(scene_vertex_t, color)));
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(scene_vertex_t),
+                          (const void *)(offset + offsetof(scene_vertex_t, uv)));
+}
+
+// The geometry in windows of at most 65536 vertices with 16-bit indices: Mali-400 has no
+// 32-bit indices, and unindexed costs it 3x the vertices. ES 2 has no base vertex, so each
+// batch points the attributes at its window. Returns the bytes uploaded.
 static size_t upload_geometry(void)
 {
-    const scene_vertex_t *vertices = scene.vertices;
-    size_t vertex_count = scene.vertex_count, bytes = 0;
-    scene_vertex_t *expanded = NULL;
+    const uint32_t n = scene.index_count;
+    uint32_t *owner = calloc((size_t)scene.vertex_count + 1, 4), *local = malloc((size_t)scene.vertex_count * 4 + 4);
+    uint16_t *indices = malloc((size_t)n * 2 + 2);
+    size_t capacity = (size_t)scene.vertex_count + 1, used = 0, window = 0, batch_capacity = 16;
+    scene_vertex_t *vertices = malloc(capacity * sizeof *vertices);
+    batches = malloc(batch_capacity * sizeof *batches);
+    if (!owner || !local || !indices || !vertices || !batches)
+        die("out of memory");
+    uint32_t chunk = 1;
+    batch_count = 0;
+    for (int d = 0; d < scene.draw_count; d++)
+    {
+        const scene_draw_t *draw = &scene.draws[d];
+        batch_t *b = NULL;
+        for (uint32_t t = 0; t + 3 <= draw->index_count; t += 3)
+        {
+            const uint32_t at = draw->first_index + t, *tri = &scene.indices[at];
+            const size_t fresh = (owner[tri[0]] != chunk) + (owner[tri[1]] != chunk) + (owner[tri[2]] != chunk);
+            if (used - window + fresh > 65536)
+            {
+                chunk++;
+                window = used;
+                b = NULL;
+            }
+            if (!b)
+            {
+                if (batch_count == (int)batch_capacity &&
+                    !(batches = realloc(batches, (batch_capacity *= 2) * sizeof *batches)))
+                    die("out of memory");
+                b = &batches[batch_count++];
+                *b = (batch_t){d, at, 0, window * sizeof(scene_vertex_t)};
+            }
+            for (int k = 0; k < 3; k++)
+            {
+                const uint32_t v = tri[k];
+                if (owner[v] != chunk)
+                {
+                    if (used == capacity && !(vertices = realloc(vertices, (capacity *= 2) * sizeof *vertices)))
+                        die("out of memory");
+                    owner[v] = chunk;
+                    local[v] = (uint32_t)(used - window);
+                    vertices[used++] = scene.vertices[v];
+                }
+                indices[at + k] = (uint16_t)local[v];
+            }
+            b->index_count += 3;
+        }
+    }
     GLuint buffers[2];
     glGenBuffers(2, buffers);
-    if (scene.vertex_count <= 65536 || has_extension("GL_OES_element_index_uint"))
-    {
-        index_type = scene.vertex_count <= 65536 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
-        index_bytes = index_type == GL_UNSIGNED_SHORT ? 2 : 4;
-        void *indices = scene.indices;
-        if (index_bytes == 2)
-        {
-            uint16_t *small = malloc((size_t)scene.index_count * 2 + 2);
-            for (uint32_t i = 0; i < scene.index_count; i++)
-                small[i] = (uint16_t)scene.indices[i];
-            indices = small;
-        }
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buffers[1]);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(scene.index_count * index_bytes), indices, GL_STATIC_DRAW);
-        bytes += scene.index_count * index_bytes;
-        if (indices != scene.indices)
-            free(indices);
-    }
-    else
-    {
-        expanded = malloc((size_t)scene.index_count * sizeof *expanded + 1);
-        for (uint32_t i = 0; i < scene.index_count; i++)
-            expanded[i] = scene.vertices[scene.indices[i]];
-        vertices = expanded;
-        vertex_count = scene.index_count;
-    }
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buffers[1]);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)n * 2, indices, GL_STATIC_DRAW);
+    check_gl("uploading the indices");
     glBindBuffer(GL_ARRAY_BUFFER, buffers[0]);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vertex_count * sizeof *vertices), vertices, GL_STATIC_DRAW);
-    bytes += vertex_count * sizeof *vertices;
-    free(expanded);
-    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(scene_vertex_t),
-                          (const void *)offsetof(scene_vertex_t, position));
-    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(scene_vertex_t),
-                          (const void *)offsetof(scene_vertex_t, color));
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(scene_vertex_t), (const void *)offsetof(scene_vertex_t, uv));
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(used * sizeof *vertices), vertices, GL_STATIC_DRAW);
+    check_gl("uploading the vertices");
     for (GLuint a = 0; a < 3; a++)
         glEnableVertexAttribArray(a);
-    return bytes;
+    free(owner);
+    free(local);
+    free(indices);
+    free(vertices);
+    return (size_t)n * 2 + used * sizeof(scene_vertex_t);
 }
 
 static void render(int mode)
@@ -291,9 +386,13 @@ static void render(int mode)
         }
         int program = -1, blended = -1, culled = -1, clockwise = -1;
         GLuint texture = 0;
-        for (int i = 0; i < scene.draw_count; i++)
+        size_t offset = SIZE_MAX;
+        for (int i = 0; i < batch_count; i++)
         {
-            const scene_draw_t *d = &scene.draws[i];
+            const batch_t *b = &batches[i];
+            if (b->vertex_offset != offset)
+                point_attributes(offset = b->vertex_offset);
+            const scene_draw_t *d = &scene.draws[b->draw];
             const int textured = d->texture >= 0;
             if (textured != program)
                 glUseProgram(programs[program = textured]);
@@ -312,7 +411,7 @@ static void render(int mode)
                     glDepthMask(GL_TRUE);
                 }
             }
-            if (!d->double_sided != culled)
+            if ((!d->double_sided) != culled)
             {
                 if ((culled = !d->double_sided))
                     glEnable(GL_CULL_FACE);
@@ -321,11 +420,8 @@ static void render(int mode)
             }
             if (d->clockwise != clockwise)
                 glFrontFace((clockwise = d->clockwise) ? GL_CW : GL_CCW);
-            if (index_type)
-                glDrawElements(GL_TRIANGLES, (GLsizei)d->index_count, index_type,
-                               (const void *)(d->first_index * index_bytes));
-            else
-                glDrawArrays(GL_TRIANGLES, (GLint)d->first_index, (GLsizei)d->index_count);
+            glDrawElements(GL_TRIANGLES, (GLsizei)b->index_count, GL_UNSIGNED_SHORT,
+                           (const void *)((size_t)b->first_index * 2));
         }
     }
     if (discard)
@@ -625,9 +721,9 @@ static result_t run(int mode, int frames)
         }
         else if (i == -WARMUP)
         {
-            const GLenum e = glGetError();
-            if (e != GL_NO_ERROR)
-                die("GL error 0x%04x drawing the %s", e, mode_names[mode]);
+            char what[64];
+            snprintf(what, sizeof what, "drawing the %s", mode_names[mode]);
+            check_gl(what);
         }
     }
     if (tracing)
@@ -835,20 +931,16 @@ int main(int argc, char **argv)
     glCullFace(GL_BACK);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_DITHER);
+    check_gl("setting up");
     upload_textures();
     const size_t bytes = upload_geometry();
-    const GLenum e = glGetError();
-    if (e != GL_NO_ERROR)
-        die("GL error 0x%04x setting up (0x0505: out of memory)", e);
 
     printf("%s, angle %g: %u triangles, %u vertices, %d texture%s, %d draw calls, %s camera\n", model, angle,
            scene.index_count / 3, scene.vertex_count, scene.texture_count, scene.texture_count == 1 ? "" : "s",
            scene.draw_count, scene.own_camera ? "its" : "the default");
-    printf("%d x %d, depth %d-bit%s; %.1f MiB of geometry, %s\n", width, height, depth24 ? 24 : 16,
-           discard ? ", discarded" : ", written back (no EXT_discard_framebuffer)", bytes / 1048576.0,
-           index_type == GL_UNSIGNED_SHORT ? "16-bit indices"
-           : index_type                    ? "32-bit indices"
-                                           : "unindexed (no OES_element_index_uint)");
+    printf("%d x %d, depth %d-bit%s; %.1f MiB of geometry, 16-bit indices, %d batches\n", width, height,
+           depth24 ? 24 : 16, discard ? ", discarded" : ", written back (no EXT_discard_framebuffer)",
+           bytes / 1048576.0, batch_count);
 
     if (use_trace)
         trace_open();
